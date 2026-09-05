@@ -698,18 +698,21 @@ pub fn send_desktop_notification_rich(
         if let Some(sound) = sound.filter(|s| !s.trim().is_empty()) {
             script.push_str(&format!(" sound name \"{}\"", applescript_escape(sound)));
         }
-        let _ = std::process::Command::new("osascript")
+        let spawned = std::process::Command::new("osascript")
             .arg("-e")
             .arg(script)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
+        if let Ok(child) = spawned {
+            jcode_base::platform::reap_detached(child);
+        }
     }
     #[cfg(target_os = "linux")]
     {
         let _ = (subtitle, sound);
-        let _ = std::process::Command::new("notify-send")
+        let spawned = std::process::Command::new("notify-send")
             .arg("--app-name=jcode")
             .arg(title)
             .arg(body)
@@ -717,6 +720,11 @@ pub fn send_desktop_notification_rich(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
+        if let Ok(child) = spawned {
+            // `Drop for Child` does not reap; without this the notification
+            // leaves a zombie for the lifetime of the process.
+            jcode_base::platform::reap_detached(child);
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
