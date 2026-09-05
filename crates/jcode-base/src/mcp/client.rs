@@ -139,7 +139,8 @@ impl McpHandle {
 /// clones can be distributed to different sessions.
 pub struct McpClient {
     handle: McpHandle,
-    child: Child,
+    /// `None` only after `Drop` has handed the process to a reaper task.
+    child: Option<Child>,
 }
 
 impl McpClient {
@@ -279,7 +280,10 @@ impl McpClient {
             request_timeout: request_timeout_for(config),
         };
 
-        let mut client = Self { handle, child };
+        let mut client = Self {
+            handle,
+            child: Some(child),
+        };
 
         client
             .initialize()
@@ -346,10 +350,9 @@ impl McpClient {
 
     /// Check if server is still running
     pub fn is_running(&mut self) -> bool {
-        match self.child.try_wait() {
-            Ok(None) => true,
-            Ok(Some(_)) => false,
-            Err(_) => false,
+        match self.child.as_mut().map(Child::try_wait) {
+            Some(Ok(None)) => true,
+            Some(Ok(Some(_))) | Some(Err(_)) | None => false,
         }
     }
 
@@ -363,7 +366,10 @@ impl McpClient {
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let _ = self.child.kill().await;
+        if let Some(child) = self.child.as_mut() {
+            // `kill` awaits the exit, so the process is reaped here.
+            let _ = child.kill().await;
+        }
     }
 
     // === Legacy compatibility methods that delegate to handle ===
@@ -419,7 +425,23 @@ fn mcp_child_env(
 
 impl Drop for McpClient {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.start_kill();
+        // A dropped tokio `Child` is only reaped when the runtime next drains
+        // its orphan queue (on SIGCHLD, best effort). In the long-lived daemon
+        // that left every replaced MCP server as a zombie until the next
+        // reload. Wait for it on a detached task when a runtime is available;
+        // without one, dropping falls back to the orphan queue.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _ = child.wait().await;
+                });
+            }
+            Err(_) => drop(child),
+        }
     }
 }
 

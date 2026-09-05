@@ -2281,6 +2281,17 @@ impl Server {
 
     /// Start the server (both main and debug sockets)
     pub async fn run(&self) -> Result<()> {
+        // A self-reload `exec`s in place, so children of the previous image
+        // (tool shells, MCP servers, power-inhibit helpers) are still ours but
+        // the old runtime's reaping state is gone. Collect whatever already
+        // exited so they do not linger as zombies for the daemon's lifetime.
+        let reaped = crate::platform::reap_exited_children();
+        if reaped > 0 {
+            crate::logging::info(&format!(
+                "Reaped {reaped} exited child process(es) inherited across reload"
+            ));
+        }
+
         // Ensure socket directory exists (for named sockets like /run/user/1000/jcode/)
         if let Some(parent) = self.socket_path.parent() {
             std::fs::create_dir_all(parent)?;
