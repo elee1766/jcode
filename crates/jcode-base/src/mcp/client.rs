@@ -530,4 +530,51 @@ done
         let reported = client.server_info().expect("server info").name;
         assert!(!reported.is_empty());
     }
+
+    /// Dropping the client must not leave the server as a zombie. `Drop`
+    /// waits on the killed child from a detached task rather than handing it
+    /// to tokio's orphan queue, which is only drained when the runtime parks
+    /// and is discarded outright by an in-place `exec` reload. Inside one
+    /// test runtime the orphan queue also drains promptly, so this guards the
+    /// contract (no `<defunct>` after drop) rather than distinguishing the
+    /// two mechanisms.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_client_reaps_server_process() {
+        let client =
+            McpClient::connect_in_dir("drop-reap-test".to_string(), &fake_server_config(), None)
+                .await
+                .expect("connect");
+        let pid = client
+            .child
+            .as_ref()
+            .and_then(|c| c.id())
+            .expect("child pid");
+
+        drop(client);
+
+        let stat_path = format!("/proc/{pid}/stat");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let stat = std::fs::read_to_string(&stat_path).ok();
+            let state = stat.as_deref().and_then(|s| {
+                s.rsplit(')')
+                    .next()?
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+            });
+            match state.as_deref() {
+                // Reaped: the /proc entry is gone.
+                None => break,
+                Some("Z") if std::time::Instant::now() >= deadline => {
+                    panic!("MCP server {pid} left as a zombie after McpClient drop");
+                }
+                Some(_) if std::time::Instant::now() >= deadline => {
+                    panic!("MCP server {pid} still alive after McpClient drop");
+                }
+                Some(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+    }
 }
